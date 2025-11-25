@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+"""
+Financial Prediction Dashboard
+Streamlit UI for Prediction Model v3.0
+
+Allows users to:
+1. Upload CSV files with OHLCV price data
+2. Analyze predictions using the reference level system
+3. Visualize results with interactive charts
+4. Export predictions as JSON
+"""
+
+import streamlit as st
+import pandas as pd
+import json
+from datetime import datetime
+from pathlib import Path
+import traceback
+
+# Configure page
+st.set_page_config(
+    page_title="Financial Prediction Dashboard",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS
+st.markdown("""
+<style>
+    .metric-card {
+        background-color: #f0f2f6;
+        padding: 20px;
+        border-radius: 10px;
+        text-align: center;
+        margin: 10px 0;
+    }
+    .bullish {
+        color: #00AA00;
+        font-weight: bold;
+    }
+    .bearish {
+        color: #FF0000;
+        font-weight: bold;
+    }
+    .neutral {
+        color: #FFA500;
+        font-weight: bold;
+    }
+    .main-title {
+        font-size: 2.5rem;
+        font-weight: bold;
+        margin-bottom: 10px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Title
+st.markdown('<div class="main-title">📊 Financial Prediction Dashboard</div>', unsafe_allow_html=True)
+st.markdown("Analyze price data using the Reference Level Prediction System")
+st.divider()
+
+# Initialize session state
+if 'analysis_result' not in st.session_state:
+    st.session_state.analysis_result = None
+if 'analysis_history' not in st.session_state:
+    st.session_state.analysis_history = []
+
+# Sidebar configuration
+with st.sidebar:
+    st.header("⚙️ Configuration")
+    st.markdown("### Analysis Settings")
+
+    analysis_mode = st.radio(
+        "Select Analysis Mode",
+        ("Upload & Analyze", "View History"),
+        help="Choose between analyzing new data or viewing past predictions"
+    )
+
+# Main content
+if analysis_mode == "Upload & Analyze":
+    # File upload section
+    st.header("📁 Step 1: Upload CSV File")
+
+    uploaded_file = st.file_uploader(
+        "Choose a CSV file with OHLCV data",
+        type="csv",
+        help="Required columns: time, open, high, low, close"
+    )
+
+    if uploaded_file is not None:
+        # Load CSV
+        df = pd.read_csv(uploaded_file)
+
+        # Validate columns
+        required_cols = ['time', 'open', 'high', 'low', 'close']
+        missing_cols = set(required_cols) - set(df.columns)
+
+        if missing_cols:
+            st.error(f"❌ Missing required columns: {', '.join(missing_cols)}")
+            st.info(f"Required columns: {', '.join(required_cols)}")
+        else:
+            # Show preview
+            st.subheader("📊 Data Preview")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write(f"**Total candles:** {len(df)}")
+                st.write(f"**Columns:** {', '.join(df.columns.tolist())}")
+            with col2:
+                st.write(f"**File size:** {uploaded_file.size / 1024:.1f} KB")
+                st.write(f"**Uploaded:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+            with st.expander("View sample data (first 10 rows)"):
+                st.dataframe(df.head(10), use_container_width=True)
+
+            # Analyze button
+            st.divider()
+            st.header("📈 Step 2: Run Analysis")
+
+            if st.button("🔍 Analyze Data", key="analyze_btn", use_container_width=True):
+                with st.spinner("Running prediction analysis..."):
+                    try:
+                        # Import prediction engine
+                        from extract_and_analyze import DataExtractor
+                        from prediction_model_v3 import PredictionEngine, OutputFormatter
+
+                        # Parse time column
+                        df['time'] = pd.to_datetime(df['time'], utc=True)
+                        df.set_index('time', inplace=True)
+
+                        # Identify instrument from filename
+                        filename = uploaded_file.name
+                        instrument = "US100"  # Default
+
+                        if "NQ" in filename.upper():
+                            instrument = "US100"
+                        elif "ES" in filename.upper():
+                            instrument = "ES"
+                        elif "UK100" in filename.upper() or "FTSE" in filename.upper():
+                            instrument = "UK100"
+
+                        # Get timezone mapping
+                        timezone_map = {
+                            'US100': 'America/New_York',
+                            'ES': 'America/Chicago',
+                            'UK100': 'Europe/London',
+                        }
+
+                        timezone = timezone_map.get(instrument, 'UTC')
+
+                        # Convert timezone
+                        df.index = df.index.tz_convert(timezone)
+
+                        # Get latest timestamp
+                        latest_timestamp = str(df.index[-1])
+
+                        # Run prediction
+                        engine = PredictionEngine(instrument=instrument)
+                        result = engine.analyze(df, latest_timestamp)
+
+                        # Store result
+                        st.session_state.analysis_result = {
+                            'result': result,
+                            'instrument': instrument,
+                            'timezone': timezone,
+                            'timestamp': datetime.now().isoformat(),
+                            'filename': filename,
+                            'data_length': len(df),
+                            'current_price': df.iloc[-1]['close']
+                        }
+
+                        # Add to history
+                        st.session_state.analysis_history.append(st.session_state.analysis_result)
+
+                        st.success("✅ Analysis completed successfully!")
+                        st.rerun()
+
+                    except Exception as e:
+                        st.error(f"❌ Analysis failed: {str(e)}")
+                        st.info("💡 Make sure the CSV has the required columns: time, open, high, low, close")
+                        with st.expander("Show error details"):
+                            st.code(traceback.format_exc())
+
+if analysis_mode == "View History":
+    st.header("📜 Analysis History")
+
+    if not st.session_state.analysis_history:
+        st.info("No analysis history yet. Upload and analyze a CSV file first.")
+    else:
+        for idx, item in enumerate(reversed(st.session_state.analysis_history)):
+            with st.expander(f"📊 {item['instrument']} - {item['timestamp'][:19]}"):
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.write(f"**Instrument:** {item['instrument']}")
+                with col2:
+                    st.write(f"**Candles:** {item['data_length']}")
+                with col3:
+                    st.write(f"**Price:** ${item['current_price']:.2f}")
+
+                # Show result preview
+                result = item['result']
+                st.write("**Analysis Result:**")
+                st.json(result)
+
+
+# Display results if available
+if st.session_state.analysis_result:
+    st.divider()
+    st.header("📊 Step 3: Analysis Results")
+
+    result = st.session_state.analysis_result['result']
+    instrument = st.session_state.analysis_result['instrument']
+    current_price = st.session_state.analysis_result['current_price']
+
+    # Main metrics in columns
+    col1, col2, col3, col4 = st.columns(4)
+
+    # Bias
+    bias = result['analysis']['bias']
+    confidence = result['analysis']['confidence']
+    bullish_weight = result['analysis']['bullish_weight']
+    bearish_weight = result['analysis']['bearish_weight']
+
+    with col1:
+        st.metric(
+            label="Directional Bias",
+            value=bias,
+            delta=f"{confidence:.2f}% confidence"
+        )
+        if bias == "BULLISH":
+            st.markdown('<span class="bullish">▲ BULLISH</span>', unsafe_allow_html=True)
+        else:
+            st.markdown('<span class="bearish">▼ BEARISH</span>', unsafe_allow_html=True)
+
+    with col2:
+        st.metric(
+            label="Confidence Score",
+            value=f"{confidence:.2f}%",
+            delta="Prediction strength"
+        )
+
+    with col3:
+        st.metric(
+            label="Bullish Weight",
+            value=f"{bullish_weight*100:.2f}%",
+            delta=f"{bullish_weight*100:.2f}% of signals"
+        )
+
+    with col4:
+        st.metric(
+            label="Bearish Weight",
+            value=f"{bearish_weight*100:.2f}%",
+            delta=f"{bearish_weight*100:.2f}% of signals"
+        )
+
+    st.divider()
+
+    # Metadata section
+    st.subheader("📋 Analysis Metadata")
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.write(f"**Instrument:** {instrument}")
+        st.write(f"**Current Price:** ${current_price:.2f}")
+
+    with col2:
+        st.write(f"**Timezone:** {st.session_state.analysis_result['timezone']}")
+        st.write(f"**Timestamp:** {result['metadata']['timestamp']}")
+
+    with col3:
+        st.write(f"**Available Levels:** {result['weights']['available_levels']}/{result['weights']['total_levels']}")
+        st.write(f"**Weight Utilization:** {result['weights']['utilization']*100:.2f}%")
+
+    st.divider()
+
+    # Reference levels table
+    st.subheader("📊 Reference Levels (20)")
+
+    # Convert levels to dataframe for display
+    levels_data = []
+    for level in result['levels']:
+        distance = level['distance_percent'] if level['distance_percent'] is not None else 0.0
+        levels_data.append({
+            'Level Name': level['name'].replace('_', ' ').title(),
+            'Price': f"${level['price']:.2f}",
+            'Distance (%)': f"{distance:.3f}%",
+            'Position': level['position'],
+            'Depreciation': f"{level['depreciation']:.3f}",
+            'Effective Weight': f"{level['effective_weight']:.4f}"
+        })
+
+    levels_df = pd.DataFrame(levels_data)
+    st.dataframe(levels_df, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # Export section
+    st.subheader("💾 Export Options")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        # JSON export
+        json_data = json.dumps(result, indent=2, default=str)
+        st.download_button(
+            label="📥 Download JSON",
+            data=json_data,
+            file_name=f"prediction_{instrument}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json",
+            key="json_download"
+        )
+
+    with col2:
+        # CSV export of levels
+        csv_data = levels_df.to_csv(index=False)
+        st.download_button(
+            label="📥 Download Levels CSV",
+            data=csv_data,
+            file_name=f"levels_{instrument}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+            key="csv_download"
+        )
+
+    st.divider()
+
+    # Raw result display
+    with st.expander("📄 View Raw JSON Result"):
+        st.json(result)
+
+
+# Footer
+st.divider()
+st.caption("""
+Prediction Model v3.0 — Reference Level-based Analytical Framework
+Designed for technical analysis of financial instruments (US100/NASDAQ, ES/S&P500, UK100/FTSE)
+""")
