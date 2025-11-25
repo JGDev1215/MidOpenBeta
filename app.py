@@ -8,6 +8,12 @@ Allows users to:
 2. Analyze predictions using the reference level system
 3. Visualize results with interactive charts
 4. Export predictions as JSON
+
+Enhanced with:
+- Data gap remediation using historical price cache
+- Reference level source transparency
+- Data quality reporting
+- Cache management controls
 """
 
 import streamlit as st
@@ -16,6 +22,8 @@ import json
 from datetime import datetime
 from pathlib import Path
 import traceback
+from price_cache_manager import PriceCacheManager
+from data_quality_report import DataQualityReport
 
 # Configure page
 st.set_page_config(
@@ -76,6 +84,42 @@ with st.sidebar:
         ("Upload & Analyze", "View History"),
         help="Choose between analyzing new data or viewing past predictions"
     )
+
+    # Cache Management Section
+    st.divider()
+    st.markdown("### 🗄️ Cache Management")
+
+    cache_instrument = st.selectbox(
+        "Select Instrument for Cache",
+        ["US100", "ES", "UK100"],
+        help="Manage price cache for a specific instrument"
+    )
+
+    timezone_map = {
+        'US100': 'America/New_York',
+        'ES': 'America/Chicago',
+        'UK100': 'Europe/London',
+    }
+
+    cache_manager = PriceCacheManager(cache_instrument, timezone_map[cache_instrument])
+    cache = cache_manager.load_cache()
+    num_cached = len(cache['cached_levels'])
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("📊 View Cache", key="view_cache_btn", use_container_width=True):
+            with st.expander(f"Cache for {cache_instrument}"):
+                if num_cached > 0:
+                    st.json(cache)
+                else:
+                    st.info("Cache is empty")
+
+    with col2:
+        if st.button("🗑️ Clear Old", key="cleanup_cache_btn", use_container_width=True):
+            removed = cache_manager.cleanup_old_cache(days_threshold=30)
+            st.success(f"Removed {removed} old entries")
+
+    st.metric("Cached Levels", num_cached)
 
 # Main content
 if analysis_mode == "Upload & Analyze":
@@ -270,6 +314,68 @@ if st.session_state.analysis_result:
     with col3:
         st.write(f"**Available Levels:** {result['weights']['available_levels']}/{result['weights']['total_levels']}")
         st.write(f"**Weight Utilization:** {result['weights']['utilization']*100:.2f}%")
+
+    st.divider()
+
+    # Level sources section
+    st.subheader("📋 Reference Level Sources")
+
+    level_sources = result.get('level_sources', {})
+
+    if level_sources:
+        # Create source tracking display
+        source_cols = st.columns(3)
+        with source_cols[0]:
+            st.write("**Level**")
+        with source_cols[1]:
+            st.write("**Price**")
+        with source_cols[2]:
+            st.write("**Source**")
+
+        for level in result['levels']:
+            level_name = level['name']
+            source = level_sources.get(level_name, "UNKNOWN")
+
+            # Determine color indicator
+            if "CURRENT_DATA" in source:
+                indicator = "🟢"  # Green: from current CSV
+                status = "Current Data"
+            elif "CACHE" in source:
+                indicator = "🟡"  # Yellow: from historical cache
+                status = "Cached (Validated)"
+            else:
+                indicator = "🔴"  # Red: unavailable
+                status = "Unavailable"
+
+            cols = st.columns(3)
+            with cols[0]:
+                st.write(f"{indicator} {level_name}")
+            with cols[1]:
+                st.write(f"${level['price']:.2f}" if level['price'] else "N/A")
+            with cols[2]:
+                st.write(f"**{status}**")
+                st.caption(source)
+
+        st.caption("🟢 = From current CSV  |  🟡 = From cache (validated)  |  🔴 = Not available")
+
+    st.divider()
+
+    # Data Quality Report
+    st.subheader("📊 Data Quality Report")
+
+    quality_report = DataQualityReport(instrument, st.session_state.analysis_result['timezone'])
+
+    # Analyze data coverage
+    expected_levels = [l['name'] for l in result['levels']]
+    quality_report.analyze_data_coverage(
+        None,  # We don't need the dataframe for this analysis
+        expected_levels,
+        level_sources
+    )
+
+    # Display report
+    quality_text = quality_report.generate_report()
+    st.text(quality_text)
 
     st.divider()
 
