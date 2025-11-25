@@ -6,12 +6,15 @@ A multi-instrument prediction framework that analyzes price positions
 relative to 20 reference levels (14 always-available, 6 conditional).
 
 Outputs: directional bias, confidence score, weight distribution, and detailed level analysis.
+
+Enhanced with price cache manager for historical data gap remediation.
 """
 
 import pandas as pd
 from datetime import datetime, timedelta
 import pytz
 from typing import Dict, List, Tuple, Any
+from price_cache_manager import PriceCacheManager
 
 
 class ReferenceLevel:
@@ -167,6 +170,9 @@ class PredictionEngine:
         self.timezone = timezone or timezone_map.get(instrument, 'America/New_York')
         self.tz = pytz.timezone(self.timezone)
 
+        # Initialize cache manager for historical data gap remediation
+        self.cache_manager = PriceCacheManager(instrument, self.timezone)
+
         # Select level configuration
         if instrument == 'US100':
             self.levels = [self._copy_level(l) for l in self.US100_LEVELS]
@@ -178,13 +184,19 @@ class PredictionEngine:
             # Default to US100 for unknown instruments
             self.levels = [self._copy_level(l) for l in self.US100_LEVELS]
 
+        # Track source of each level (CURRENT_DATA, CACHE, or UNAVAILABLE)
+        self.level_sources = {}
+
     @staticmethod
     def _copy_level(level: ReferenceLevel) -> ReferenceLevel:
         """Create a fresh copy of a level template."""
         return ReferenceLevel(level.name, level.base_weight, level.level_type, level.availability_time)
 
     def _calculate_levels(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """Calculate all reference level prices from OHLC data."""
+        """
+        Calculate all reference level prices from OHLC data.
+        Uses cache as fallback when current data doesn't contain required time periods.
+        """
         # Convert index to instrument timezone if needed
         current_time = df.index[-1]
         if current_time.tzinfo is None:
@@ -208,18 +220,58 @@ class PredictionEngine:
 
         if len(today_data) > 0:
             levels_dict['daily_midnight'] = today_data['open'].iloc[0]
+            self.level_sources['daily_midnight'] = 'CURRENT_DATA'
         else:
-            levels_dict['daily_midnight'] = opens.iloc[-1]
+            # Try cache as fallback
+            cached_price, is_valid, reason = self.cache_manager.get_cached_price('daily_midnight', current_time)
+            if cached_price is not None and is_valid:
+                levels_dict['daily_midnight'] = cached_price
+                self.level_sources['daily_midnight'] = f'CACHE ({reason})'
+            else:
+                levels_dict['daily_midnight'] = opens.iloc[-1]
+                self.level_sources['daily_midnight'] = f'UNAVAILABLE ({reason})'
 
         # Previous hourly open
         if len(opens) > 1:
             levels_dict['previous_hourly'] = opens.iloc[-2]
+            self.level_sources['previous_hourly'] = 'CURRENT_DATA'
         else:
-            levels_dict['previous_hourly'] = opens.iloc[-1]
+            # Try cache as fallback
+            cached_price, is_valid, reason = self.cache_manager.get_cached_price('previous_hourly', current_time)
+            if cached_price is not None and is_valid:
+                levels_dict['previous_hourly'] = cached_price
+                self.level_sources['previous_hourly'] = f'CACHE ({reason})'
+            else:
+                levels_dict['previous_hourly'] = opens.iloc[-1]
+                self.level_sources['previous_hourly'] = f'UNAVAILABLE ({reason})'
 
-        # 2-hour and 4-hour opens (approximate from available data)
-        levels_dict['2h_open'] = opens.iloc[max(0, len(opens) - 120)] if len(opens) > 120 else opens.iloc[0]
-        levels_dict['4h_open'] = opens.iloc[max(0, len(opens) - 240)] if len(opens) > 240 else opens.iloc[0]
+        # 2-hour open
+        if len(opens) > 120:
+            levels_dict['2h_open'] = opens.iloc[-120]
+            self.level_sources['2h_open'] = 'CURRENT_DATA'
+        else:
+            # Try cache as fallback
+            cached_price, is_valid, reason = self.cache_manager.get_cached_price('2h_open', current_time)
+            if cached_price is not None and is_valid:
+                levels_dict['2h_open'] = cached_price
+                self.level_sources['2h_open'] = f'CACHE ({reason})'
+            else:
+                levels_dict['2h_open'] = opens.iloc[0]
+                self.level_sources['2h_open'] = f'UNAVAILABLE ({reason})'
+
+        # 4-hour open
+        if len(opens) > 240:
+            levels_dict['4h_open'] = opens.iloc[-240]
+            self.level_sources['4h_open'] = 'CURRENT_DATA'
+        else:
+            # Try cache as fallback
+            cached_price, is_valid, reason = self.cache_manager.get_cached_price('4h_open', current_time)
+            if cached_price is not None and is_valid:
+                levels_dict['4h_open'] = cached_price
+                self.level_sources['4h_open'] = f'CACHE ({reason})'
+            else:
+                levels_dict['4h_open'] = opens.iloc[0]
+                self.level_sources['4h_open'] = f'UNAVAILABLE ({reason})'
 
         # NY/London/Chicago opens (9:30 AM ET for US100, 8:30 AM CT for ES)
         if self.instrument in ['US100', 'ES']:
@@ -230,8 +282,29 @@ class PredictionEngine:
                 session_data = df[(df.index >= session_start) & (df.index < today_start.replace(hour=16))]
                 preopen_data = df[(df.index >= preopen_start) & (df.index < session_start)]
 
-                levels_dict['ny_open'] = session_data['open'].iloc[0] if len(session_data) > 0 else opens.iloc[-1]
-                levels_dict['ny_preopen'] = preopen_data['open'].iloc[0] if len(preopen_data) > 0 else opens.iloc[-1]
+                if len(session_data) > 0:
+                    levels_dict['ny_open'] = session_data['open'].iloc[0]
+                    self.level_sources['ny_open'] = 'CURRENT_DATA'
+                else:
+                    cached_price, is_valid, reason = self.cache_manager.get_cached_price('ny_open', current_time)
+                    if cached_price is not None and is_valid:
+                        levels_dict['ny_open'] = cached_price
+                        self.level_sources['ny_open'] = f'CACHE ({reason})'
+                    else:
+                        levels_dict['ny_open'] = opens.iloc[-1]
+                        self.level_sources['ny_open'] = f'UNAVAILABLE ({reason})'
+
+                if len(preopen_data) > 0:
+                    levels_dict['ny_preopen'] = preopen_data['open'].iloc[0]
+                    self.level_sources['ny_preopen'] = 'CURRENT_DATA'
+                else:
+                    cached_price, is_valid, reason = self.cache_manager.get_cached_price('ny_preopen', current_time)
+                    if cached_price is not None and is_valid:
+                        levels_dict['ny_preopen'] = cached_price
+                        self.level_sources['ny_preopen'] = f'CACHE ({reason})'
+                    else:
+                        levels_dict['ny_preopen'] = opens.iloc[-1]
+                        self.level_sources['ny_preopen'] = f'UNAVAILABLE ({reason})'
             else:  # ES - Chicago market
                 # ES (Chicago) opens at 8:30 AM CT (which is 9:30 AM ET)
                 chicago_tz = pytz.timezone('America/Chicago')
@@ -242,13 +315,29 @@ class PredictionEngine:
                 session_data = df[(df.index >= session_start) & (df.index < session_start.replace(hour=15))]
                 preopen_data = df[(df.index >= preopen_start) & (df.index < session_start)]
 
-                levels_dict['chicago_open'] = session_data['open'].iloc[0] if len(session_data) > 0 else opens.iloc[-1]
-                levels_dict['chicago_preopen'] = preopen_data['open'].iloc[0] if len(preopen_data) > 0 else opens.iloc[-1]
+                if len(session_data) > 0:
+                    levels_dict['chicago_open'] = session_data['open'].iloc[0]
+                    self.level_sources['chicago_open'] = 'CURRENT_DATA'
+                else:
+                    levels_dict['chicago_open'] = opens.iloc[-1]
+                    self.level_sources['chicago_open'] = 'UNAVAILABLE (no session data)'
+
+                if len(preopen_data) > 0:
+                    levels_dict['chicago_preopen'] = preopen_data['open'].iloc[0]
+                    self.level_sources['chicago_preopen'] = 'CURRENT_DATA'
+                else:
+                    levels_dict['chicago_preopen'] = opens.iloc[-1]
+                    self.level_sources['chicago_preopen'] = 'UNAVAILABLE (no preopen data)'
         else:
             # London market opens at 8 AM GMT
             session_start = today_start.replace(hour=8)
             session_data = df[df.index >= session_start]
-            levels_dict['london_open'] = session_data['open'].iloc[0] if len(session_data) > 0 else opens.iloc[-1]
+            if len(session_data) > 0:
+                levels_dict['london_open'] = session_data['open'].iloc[0]
+                self.level_sources['london_open'] = 'CURRENT_DATA'
+            else:
+                levels_dict['london_open'] = opens.iloc[-1]
+                self.level_sources['london_open'] = 'UNAVAILABLE (no session data)'
 
         # Previous day high/low
         yesterday_start = today_start - timedelta(days=1)
@@ -257,9 +346,13 @@ class PredictionEngine:
         if len(yesterday_data) > 0:
             levels_dict['prev_day_high'] = yesterday_data['high'].max()
             levels_dict['prev_day_low'] = yesterday_data['low'].min()
+            self.level_sources['prev_day_high'] = 'CURRENT_DATA'
+            self.level_sources['prev_day_low'] = 'CURRENT_DATA'
         else:
             levels_dict['prev_day_high'] = highs.iloc[-1]
             levels_dict['prev_day_low'] = lows.iloc[-1]
+            self.level_sources['prev_day_high'] = 'UNAVAILABLE (no yesterday data)'
+            self.level_sources['prev_day_low'] = 'UNAVAILABLE (no yesterday data)'
 
         # Weekly levels
         weekday = current_time.weekday()
@@ -271,10 +364,16 @@ class PredictionEngine:
             levels_dict['weekly_open'] = week_data['open'].iloc[0]
             levels_dict['weekly_high'] = week_data['high'].max()
             levels_dict['weekly_low'] = week_data['low'].min()
+            self.level_sources['weekly_open'] = 'CURRENT_DATA'
+            self.level_sources['weekly_high'] = 'CURRENT_DATA'
+            self.level_sources['weekly_low'] = 'CURRENT_DATA'
         else:
             levels_dict['weekly_open'] = opens.iloc[-1]
             levels_dict['weekly_high'] = highs.iloc[-1]
             levels_dict['weekly_low'] = lows.iloc[-1]
+            self.level_sources['weekly_open'] = 'UNAVAILABLE (no week data)'
+            self.level_sources['weekly_high'] = 'UNAVAILABLE (no week data)'
+            self.level_sources['weekly_low'] = 'UNAVAILABLE (no week data)'
 
         # Previous week
         prev_week_start = week_start - timedelta(days=7)
@@ -283,9 +382,13 @@ class PredictionEngine:
         if len(prev_week_data) > 0:
             levels_dict['prev_week_high'] = prev_week_data['high'].max()
             levels_dict['prev_week_low'] = prev_week_data['low'].min()
+            self.level_sources['prev_week_high'] = 'CURRENT_DATA'
+            self.level_sources['prev_week_low'] = 'CURRENT_DATA'
         else:
             levels_dict['prev_week_high'] = highs.iloc[-1]
             levels_dict['prev_week_low'] = lows.iloc[-1]
+            self.level_sources['prev_week_high'] = 'UNAVAILABLE (no prev week data)'
+            self.level_sources['prev_week_low'] = 'UNAVAILABLE (no prev week data)'
 
         # Monthly levels
         month_start = self.tz.localize(datetime(current_time.year, current_time.month, 1))
@@ -293,8 +396,10 @@ class PredictionEngine:
 
         if len(month_data) > 0:
             levels_dict['monthly_open'] = month_data['open'].iloc[0]
+            self.level_sources['monthly_open'] = 'CURRENT_DATA'
         else:
             levels_dict['monthly_open'] = opens.iloc[-1]
+            self.level_sources['monthly_open'] = 'UNAVAILABLE (no month data)'
 
         # Asian range (20:00 previous day - 00:00 current day, in instrument timezone)
         try:
@@ -315,9 +420,13 @@ class PredictionEngine:
         if len(asian_data) > 0:
             levels_dict['asian_range_high'] = asian_data['high'].max()
             levels_dict['asian_range_low'] = asian_data['low'].min()
+            self.level_sources['asian_range_high'] = 'CURRENT_DATA'
+            self.level_sources['asian_range_low'] = 'CURRENT_DATA'
         else:
             levels_dict['asian_range_high'] = highs.iloc[-1]
             levels_dict['asian_range_low'] = lows.iloc[-1]
+            self.level_sources['asian_range_high'] = 'UNAVAILABLE (no asian range data)'
+            self.level_sources['asian_range_low'] = 'UNAVAILABLE (no asian range data)'
 
         # London range (03:00 - 11:00 ET or 08:00 - 16:30 GMT)
         london_start = today_start.replace(hour=3)
@@ -327,9 +436,13 @@ class PredictionEngine:
         if len(london_data) > 0:
             levels_dict['london_range_high'] = london_data['high'].max()
             levels_dict['london_range_low'] = london_data['low'].min()
+            self.level_sources['london_range_high'] = 'CURRENT_DATA'
+            self.level_sources['london_range_low'] = 'CURRENT_DATA'
         else:
             levels_dict['london_range_high'] = highs.iloc[-1]
             levels_dict['london_range_low'] = lows.iloc[-1]
+            self.level_sources['london_range_high'] = 'UNAVAILABLE (no london range data)'
+            self.level_sources['london_range_low'] = 'UNAVAILABLE (no london range data)'
 
         # Trading range - NY for US100, Chicago for ES
         if self.instrument == 'US100':
@@ -341,9 +454,13 @@ class PredictionEngine:
             if len(range_data) > 0:
                 levels_dict['ny_range_high'] = range_data['high'].max()
                 levels_dict['ny_range_low'] = range_data['low'].min()
+                self.level_sources['ny_range_high'] = 'CURRENT_DATA'
+                self.level_sources['ny_range_low'] = 'CURRENT_DATA'
             else:
                 levels_dict['ny_range_high'] = highs.iloc[-1]
                 levels_dict['ny_range_low'] = lows.iloc[-1]
+                self.level_sources['ny_range_high'] = 'UNAVAILABLE (no ny range data)'
+                self.level_sources['ny_range_low'] = 'UNAVAILABLE (no ny range data)'
         else:  # ES - Chicago market
             # Chicago range (08:30 AM - 14:00 CT / 9:30 AM - 15:00 ET)
             chicago_tz = pytz.timezone('America/Chicago')
@@ -356,9 +473,13 @@ class PredictionEngine:
             if len(range_data) > 0:
                 levels_dict['chicago_range_high'] = range_data['high'].max()
                 levels_dict['chicago_range_low'] = range_data['low'].min()
+                self.level_sources['chicago_range_high'] = 'CURRENT_DATA'
+                self.level_sources['chicago_range_low'] = 'CURRENT_DATA'
             else:
                 levels_dict['chicago_range_high'] = highs.iloc[-1]
                 levels_dict['chicago_range_low'] = lows.iloc[-1]
+                self.level_sources['chicago_range_high'] = 'UNAVAILABLE (no chicago range data)'
+                self.level_sources['chicago_range_low'] = 'UNAVAILABLE (no chicago range data)'
 
         return levels_dict, current_time
 
@@ -489,6 +610,9 @@ class PredictionEngine:
         total_count = len(self.levels)
         utilization = available_count / total_count if total_count > 0 else 0
 
+        # Update cache with newly extracted data
+        self.cache_manager.update_cache(levels_dict, current_time)
+
         # Build output
         result = {
             'metadata': {
@@ -509,7 +633,8 @@ class PredictionEngine:
                 'total_levels': total_count,
                 'utilization': round(utilization, 4)
             },
-            'levels': [l.to_dict() for l in available_levels]
+            'levels': [l.to_dict() for l in available_levels],
+            'level_sources': self.level_sources  # Include source information
         }
 
         return result

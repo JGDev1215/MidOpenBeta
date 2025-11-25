@@ -33,12 +33,13 @@ PREDICTION_MODEL_TIMEZONES = {
 
 class DataExtractor:
     """Extract and prepare price data for prediction model"""
-    
+
     def __init__(self, filepath: str):
         self.filepath = filepath
         self.instrument = None
         self.timezone = None
         self.df = None
+        self.data_quality_info = {}
         
     def identify_instrument(self):
         """Identify instrument from filename"""
@@ -100,20 +101,63 @@ class DataExtractor:
     def prepare_for_prediction(self, timestamp: str = None):
         """
         Prepare data for prediction model
-        
+
         Args:
-            timestamp: Optional specific timestamp to analyze. 
+            timestamp: Optional specific timestamp to analyze.
                       If None, uses latest timestamp in data.
-        
+
         Returns:
             Tuple of (dataframe, timestamp_string)
         """
         if timestamp is None:
             timestamp = self.get_latest_timestamp()
-        
+
         print(f"\n✓ Analysis timestamp: {timestamp}")
-        
+
+        # Collect data quality information
+        self._collect_data_quality_info()
+
         return self.df, timestamp
+
+    def _collect_data_quality_info(self):
+        """Collect information about data quality."""
+        if self.df is None or len(self.df) == 0:
+            return
+
+        self.data_quality_info = {
+            'total_rows': len(self.df),
+            'time_range': f"{self.df.index[0]} to {self.df.index[-1]}",
+            'duration_hours': (self.df.index[-1] - self.df.index[0]).total_seconds() / 3600,
+            'has_gaps': self._check_continuity() == False,
+            'timezone': self.timezone
+        }
+
+    def _check_continuity(self) -> bool:
+        """
+        Check if data is continuous (no gaps).
+
+        Returns:
+            True if data is continuous, False if gaps exist
+        """
+        if self.df is None or len(self.df) < 2:
+            return True
+
+        # Assuming 1-minute data
+        time_diffs = self.df.index.to_series().diff()
+        expected_diff = pd.Timedelta(minutes=1)
+        gaps = (time_diffs != expected_diff).sum()
+
+        # Only the first NaT difference is expected
+        return gaps <= 1
+
+    def get_data_quality_info(self) -> dict:
+        """
+        Return information about data coverage and quality.
+
+        Returns:
+            Dictionary with data quality metrics
+        """
+        return self.data_quality_info
 
 
 def main():
